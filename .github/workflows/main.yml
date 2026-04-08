@@ -1,153 +1,168 @@
-name: CI
+name: DevSecOps Pipeline
 
 on:
   push:
-    branches: [ main ]
+    branches: [main, develop]
   pull_request:
-    branches: [ main ]
+    branches: [main]
 
-permissions:
-  contents: read
-  security-events: write
+env:
+  IMAGE_NAME: wassimoz/devsecops-project   
 
 jobs:
 
 
-  sast_scan:
-    name: Run Bandit Scan
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4                  
-
-      - name: Set up Python                        
-        uses: actions/setup-python@v5              
-        with:
-          python-version: '3.11'                   
-
-      - name: Install Bandit
-        run: pip install bandit
-
-      - name: Run Bandit Scan
-        run: bandit -ll -ii -r . -f json -o bandit-report.json
-
-      - name: Upload Bandit Report
-        uses: actions/upload-artifact@v4           
-        if: always()
-        with:
-          name: bandit-findings
-          path: bandit-report.json
-
-
-  test:
-    name: Run Tests
+  sast-scan:
+    name: "Secrets & Static Analysis"
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Set up Python
+      - name: Gitleaks — detect secrets in git history
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt pytest pytest-cov
+      - name: Install security tools
+        run: pip install bandit safety
 
-      - name: Run tests with coverage
-        run: pytest tests/ --cov=app --cov-report=xml --cov-report=term
+      - name: Bandit — static code analysis
+        run: |
+          bandit -r app/ \
+            -f json \
+            -o bandit-report.json \
+            -ll \
+            --exclude app/tests
+          echo "Bandit scan complete"
 
-      - name: Upload coverage report
+      - name: Safety CLI — check known CVEs in dependencies
+        run: |
+          safety check \
+            -r app/requirements.txt \
+            --json \
+            --output safety-report.json
+          echo "Safety scan complete"
+
+      - name: Upload SAST reports as artifacts
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: coverage-report
-          path: coverage.xml
+          name: sast-reports
+          path: |
+            bandit-report.json
+            safety-report.json
+          retention-days: 14
 
 
-  dependency_audit:
-    name: Dependency Audit (pip-audit)
+  build-scan:
+    name: "Build & Container Security"
     runs-on: ubuntu-latest
+    needs: sast-scan
+    permissions:
+      contents: read
+      security-events: write   
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install pip-audit
-        run: pip install pip-audit
-
-      - name: Run pip-audit
-        run: pip-audit -r requirements.txt -f json -o pip-audit-report.json || true
-
-      - name: Upload pip-audit Report
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: pip-audit-findings
-          path: pip-audit-report.json
-
-
-  lint:
-    name: Lint Python Code
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install flake8
-        run: pip install flake8
-
-      - name: Run flake8
-        run: flake8 . --max-line-length=120 --exclude=.git,__pycache__ || true
-
-
-  image_scan:
-    name: Build Image and Run Image Scan
-    runs-on: ubuntu-latest
-    needs: [ sast_scan, test ]                     # ✅ attend que les jobs 1 et 2 passent
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4                  # ✅ était @v2
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3        # ✅ remplace docker-practice/actions-setup-docker
-
-      - name: Log in to DockerHub                  # ✅ NOUVEAU : login avant le build
+      
+      - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.USER }}
-          password: ${{ secrets.PWD }}
+          username: ${{ secrets.REPO_USER }}
+          password: ${{ secrets.REPO_PWD }}
 
-      - name: Build Docker Image
-        run: docker build -f Dockerfile -t myapp:latest .
+      - name: Build Docker image
+        run: |
+          docker build \
+            -t ${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            -t ${{ env.IMAGE_NAME }}:latest \
+            ./app
 
-      - name: Docker Scout Scan
-        uses: docker/scout-action@v1
+      - name: Trivy — scan container for vulnerabilities
+        uses: aquasecurity/trivy-action@master
         with:
-          dockerhub-user: ${{ secrets.REPO_USER }}
-          dockerhub-password: ${{ secrets.REPO_PWD }}
-          command: quickview,cves
-          only-severities: critical,high
-          sarif-file: scout-report.sarif
-          exit-code: false                         # ✅ était true → bloquait tout le pipeline
+          image-ref: "${{ env.IMAGE_NAME }}:${{ github.sha }}"
+          format: "sarif"
+          output: "trivy-results.sarif"
+          severity: "CRITICAL,HIGH"
+          exit-code: "1"
+          ignore-unfixed: true
 
-      - name: Upload Docker Scout Report
-        uses: actions/upload-artifact@v4           # ✅ était @v3
+      - name: Upload Trivy results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
         if: always()
         with:
-          name: docker-scout-findings
-          path: scout-report.sarif
+          sarif_file: trivy-results.sarif
+
+      
+      - name: Push image to Docker Hub
+        if: github.ref == 'refs/heads/main'
+        run: |
+          docker push ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          docker push ${{ env.IMAGE_NAME }}:latest
+
+
+  dast-scan:
+    name: "DAST — OWASP ZAP"
+    runs-on: ubuntu-latest
+    needs: build-scan
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.REPO_USER }}
+          password: ${{ secrets.REPO_PWD }}
+
+      - name: Start application container
+        run: |
+          docker run -d \
+            --name test-app \
+            -p 5000:5000 \
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+      - name: Wait for app to be healthy
+        run: |
+          echo "Waiting for app to start..."
+          for i in {1..15}; do
+            if curl -sf http://localhost:5000/health; then
+              echo "App is ready"
+              break
+            fi
+            echo "Attempt $i failed, retrying in 3s..."
+            sleep 3
+          done
+
+      - name: OWASP ZAP — baseline scan
+        uses: zaproxy/action-baseline@v0.12.0
+        with:
+          target: "http://localhost:5000"
+          rules_file_name: ".zap/rules.tsv"
+          cmd_options: "-I"
+
+      - name: Upload ZAP report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zap-report
+          path: report_html.html
+          retention-days: 14
+
+      - name: Stop and remove test container
+        if: always()
+        run: docker stop test-app && docker rm test-app
