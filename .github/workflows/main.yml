@@ -46,10 +46,7 @@ jobs:
 
       - name: Safety CLI — check known CVEs in dependencies
         run: |
-          safety check \
-            -r app/requirements.txt \
-            --json \
-            --output safety-report.json
+          safety check -r app/requirements.txt --json > safety-report.json
           echo "Safety scan complete"
 
       - name: Upload SAST reports as artifacts
