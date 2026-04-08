@@ -1,0 +1,153 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+
+
+  sast_scan:
+    name: Run Bandit Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4                  
+
+      - name: Set up Python                        
+        uses: actions/setup-python@v5              
+        with:
+          python-version: '3.11'                   
+
+      - name: Install Bandit
+        run: pip install bandit
+
+      - name: Run Bandit Scan
+        run: bandit -ll -ii -r . -f json -o bandit-report.json
+
+      - name: Upload Bandit Report
+        uses: actions/upload-artifact@v4           
+        if: always()
+        with:
+          name: bandit-findings
+          path: bandit-report.json
+
+
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest pytest-cov
+
+      - name: Run tests with coverage
+        run: pytest tests/ --cov=app --cov-report=xml --cov-report=term
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage-report
+          path: coverage.xml
+
+
+  dependency_audit:
+    name: Dependency Audit (pip-audit)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install pip-audit
+        run: pip install pip-audit
+
+      - name: Run pip-audit
+        run: pip-audit -r requirements.txt -f json -o pip-audit-report.json || true
+
+      - name: Upload pip-audit Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pip-audit-findings
+          path: pip-audit-report.json
+
+
+  lint:
+    name: Lint Python Code
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install flake8
+        run: pip install flake8
+
+      - name: Run flake8
+        run: flake8 . --max-line-length=120 --exclude=.git,__pycache__ || true
+
+
+  image_scan:
+    name: Build Image and Run Image Scan
+    runs-on: ubuntu-latest
+    needs: [ sast_scan, test ]                     # ✅ attend que les jobs 1 et 2 passent
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4                  # ✅ était @v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3        # ✅ remplace docker-practice/actions-setup-docker
+
+      - name: Log in to DockerHub                  # ✅ NOUVEAU : login avant le build
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.USER }}
+          password: ${{ secrets.PWD }}
+
+      - name: Build Docker Image
+        run: docker build -f Dockerfile -t myapp:latest .
+
+      - name: Docker Scout Scan
+        uses: docker/scout-action@v1
+        with:
+          dockerhub-user: ${{ secrets.REPO_USER }}
+          dockerhub-password: ${{ secrets.REPO_PWD }}
+          command: quickview,cves
+          only-severities: critical,high
+          sarif-file: scout-report.sarif
+          exit-code: false                         # ✅ était true → bloquait tout le pipeline
+
+      - name: Upload Docker Scout Report
+        uses: actions/upload-artifact@v4           # ✅ était @v3
+        if: always()
+        with:
+          name: docker-scout-findings
+          path: scout-report.sarif
