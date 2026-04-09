@@ -47,6 +47,11 @@ jobs:
           safety check -r app/requirements.txt --json > safety-report.json || true
           echo "Safety scan complete"
 
+      - name: Install dependencies
+        run: |
+          pip install -r app/requirements.txt
+          pip install pytest pytest-cov
+
       - name: Run unit tests
         run: |
           cd app
